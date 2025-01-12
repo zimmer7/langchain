@@ -517,6 +517,28 @@ defmodule LangChain.ChatModels.ChatOllamaAI do
     end
   end
 
+  def do_process_response(_model, %{
+        "function" => %{
+          "arguments" => args,
+          "name" => name
+        }
+      }) do
+    case ToolCall.new(%{
+           call_id: Ecto.UUID.generate(),
+           type: :function,
+           name: name,
+           arguments: args
+         }) do
+      {:ok, %ToolCall{} = call} ->
+        call
+
+      {:error, changeset} ->
+        reason = Utils.changeset_error_to_string(changeset)
+        Logger.error("Failed to process ToolCall for a function. Reason: #{reason}")
+        {:error, reason}
+    end
+  end
+
   defp create_message(message, status, message_type) do
     case message_type.new(Map.merge(message, %{"status" => status})) do
       {:ok, new_message} ->
