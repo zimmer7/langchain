@@ -68,54 +68,47 @@ defmodule LangChain.Tools.CalculatorTest do
     test "performs repeated calls until complete with a live LLM" do
       test_pid = self()
 
-      llm_handler = %{
-        on_llm_new_message: fn _model, %Message{} = message ->
+      handlers = %{
+        on_llm_new_message: fn %LLMChain{}, %Message{} = message ->
           send(test_pid, {:callback_msg, message})
-        end
-      }
-
-      chain_handler = %{
+        end,
         on_tool_response_created: fn _chain, %Message{} = tool_message ->
           send(test_pid, {:callback_tool_msg, tool_message})
         end
       }
 
-      model = ChatOpenAI.new!(%{seed: 0, temperature: 0, stream: false, callbacks: [llm_handler]})
+      model = ChatOpenAI.new!(%{seed: 0, temperature: 0, stream: false})
 
-      {:ok, updated_chain, %Message{} = message} =
-        LLMChain.new!(%{
-          llm: model,
-          verbose: false,
-          callbacks: [chain_handler]
-        })
+      {:ok, updated_chain} =
+        %{llm: model, verbose: false}
+        |> LLMChain.new!()
         |> LLMChain.add_message(
           Message.new_user!("Answer the following math question: What is 100 + 300 - 200?")
         )
         |> LLMChain.add_tools(Calculator.new!())
+        |> LLMChain.add_callback(handlers)
         |> LLMChain.run(mode: :while_needs_response)
 
-      assert updated_chain.last_message == message
-      assert message.role == :assistant
-
-      assert message.content =~ "100 + 300 - 200"
-      assert message.content =~ "is 200"
+      assert updated_chain.last_message.role == :assistant
+      assert updated_chain.last_message.content =~ "100 + 300 - 200"
+      assert updated_chain.last_message.content =~ "is 200"
 
       # assert received multiple messages as callbacks
-      assert_received {:callback_msg, message}
-      assert message.role == :assistant
-      assert [%ToolCall{name: "calculator", arguments: %{"expression" => _}}] = message.tool_calls
+      assert_received {:callback_msg, msg}
+      assert msg.role == :assistant
+      assert [%ToolCall{name: "calculator", arguments: %{"expression" => _}}] = msg.tool_calls
 
       # the function result message
-      assert_received {:callback_tool_msg, message}
-      assert message.role == :tool
-      assert [%ToolResult{content: "200"}] = message.tool_results
+      assert_received {:callback_tool_msg, msg}
+      assert msg.role == :tool
+      assert [%ToolResult{content: "200"}] = msg.tool_results
 
-      assert_received {:callback_msg, message}
-      assert message.role == :assistant
+      assert_received {:callback_msg, msg}
+      assert msg.role == :assistant
 
-      assert message.content =~ "200"
+      assert msg.content =~ "200"
 
-      assert updated_chain.last_message == message
+      assert updated_chain.last_message == msg
     end
   end
 end

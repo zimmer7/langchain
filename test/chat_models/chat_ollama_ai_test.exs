@@ -3,11 +3,9 @@ defmodule ChatModels.ChatOllamaAITest do
 
   doctest LangChain.ChatModels.ChatOllamaAI
 
-  alias LangChain.{
-    ChatModels.ChatOllamaAI,
-    Function,
-    FunctionParam
-  }
+  alias LangChain.ChatModels.ChatOllamaAI
+  alias LangChain.Function
+  alias LangChain.FunctionParam
 
   use Mimic
 
@@ -152,7 +150,25 @@ defmodule ChatModels.ChatOllamaAITest do
 
       data = ChatOllamaAI.for_api(ollama_ai, [], [fun])
 
-      assert [%{"function" => _} | _] = data.tools
+      assert [%{} = result_data] = data.tools
+
+      assert %{
+               "type" => "function",
+               "function" => %{
+                 "description" => "Gives a friendly greeting for the given subject",
+                 "name" => "give_greeting",
+                 "parameters" => %{
+                   type: "object",
+                   required: ["name"],
+                   properties: %{
+                     name: %{
+                       type: "string",
+                       description: "The subject to greet"
+                     }
+                   }
+                 }
+               }
+             } = result_data
     end
 
     test "generates a map for an API call with a tool using FunctionParams", %{
@@ -170,7 +186,20 @@ defmodule ChatModels.ChatOllamaAITest do
 
       data = ChatOllamaAI.for_api(ollama_ai, [], [fun])
 
-      assert [%{"function" => _} | _] = data.tools
+      assert [%{} = result_data] = data.tools
+
+      assert %{
+               "function" => %{
+                 "description" => "Gives a friendly greeting for the given subject",
+                 "name" => "give_greeting",
+                 "parameters" => %{
+                   "properties" => %{"name" => %{"type" => "string"}},
+                   "required" => ["name"],
+                   "type" => "object"
+                 }
+               },
+               "type" => "function"
+             } = result_data
     end
 
     test "generates a map for an API call with a tool without parameters", %{ollama_ai: ollama_ai} do
@@ -183,7 +212,16 @@ defmodule ChatModels.ChatOllamaAITest do
 
       data = ChatOllamaAI.for_api(ollama_ai, [], [fun])
 
-      assert [%{"function" => _} | _] = data.tools
+      assert [%{} = result_data] = data.tools
+
+      assert %{
+               "function" => %{
+                 "description" => "Be friendly to the world",
+                 "name" => "greet_the_world",
+                 "parameters" => %{"properties" => %{}, "type" => "object"}
+               },
+               "type" => "function"
+             } = result_data
     end
 
     test "generates a map for an API call without tools", %{ollama_ai: ollama_ai} do
@@ -520,6 +558,90 @@ defmodule ChatModels.ChatOllamaAITest do
 
       {:ok, %{models: %{llama31: llama31}, tools: %{locator: locator}}}
     end
+
+    @tag live_call: true, live_ollama_ai: true
+    test "provided tool is not necessarily used", %{
+      models: %{llama31: model},
+      tools: %{locator: locator}
+    } do
+      {:ok, chat} = ChatOllamaAI.new(model)
+      {:ok, msg} = Message.new_user("Good morning")
+      {:ok, %{tool_calls: calls} = _message} = ChatOllamaAI.call(chat, [msg], [locator])
+
+      assert [] == calls
+    end
+
+    @tag live_call: true, live_ollama_ai: true
+    test "provided tool is called (online)", %{
+      models: %{llama31: model},
+      tools: %{locator: locator}
+    } do
+      {:ok, chat} = ChatOllamaAI.new(model)
+      {:ok, msg} = Message.new_user("Where is the hairbrush located?")
+      {:ok, %{tool_calls: calls} = _message} = ChatOllamaAI.call(chat, [msg], [locator])
+
+      assert [%Message.ToolCall{name: "locator", arguments: %{"thing" => "hairbrush"}}] = calls
+    end
+
+    @tag live_ollama_ai: true
+    test "provided tool is called", %{models: %{llama31: model}, tools: %{locator: locator}} do
+      {:ok, chat} = ChatOllamaAI.new(model)
+      {:ok, msg} = Message.new_user("Where is the hairbrush located?")
+
+      expect(ChatOllamaAI, :do_api_request, fn _model, _msgs, _tools ->
+        %LangChain.Message{
+          content: nil,
+          processed_content: nil,
+          index: nil,
+          status: :complete,
+          role: :assistant,
+          name: nil,
+          tool_calls: [
+            %LangChain.Message.ToolCall{
+              status: :complete,
+              type: :function,
+              call_id: "4806e4e4-b1fd-48a4-b969-b6ae0045bb90",
+              name: "locator",
+              arguments: %{"thing" => "hairbrush"},
+              index: nil
+            }
+          ],
+          tool_results: nil
+        }
+      end)
+
+      {:ok, %{tool_calls: calls} = _message} = ChatOllamaAI.call(chat, [msg], [locator])
+
+      assert [%Message.ToolCall{name: "locator", arguments: %{"thing" => "hairbrush"}}] = calls
+    end
+
+    setup do
+      locator =
+        Function.new!(%{
+          name: "locator",
+          description: "Returns the location of the requested element or item.",
+          parameters: [
+            FunctionParam.new!(%{
+              name: "thing",
+              type: :string,
+              description: "the thing whose location is being request"
+            })
+          ],
+          function: fn %{"thing" => thing} = _arguments, context ->
+            # our context is a pretend item/location location map
+            {:ok, context[thing]}
+          end
+        })
+
+      llama31 = %{
+        model: "llama3.1:latest",
+        temperature: 1,
+        seed: 0,
+        stream: false
+      }
+
+      {:ok, %{models: %{llama31: llama31}, tools: %{locator: locator}}}
+    end
   end
 
   describe "do_process_response/1" do
@@ -561,6 +683,48 @@ defmodule ChatModels.ChatOllamaAITest do
       assert struct.role == :assistant
       assert struct.content == "Gre"
       assert struct.status == :incomplete
+    end
+
+    test "handles receiving a tool call request response", %{model: model} do
+      response = %{
+        "created_at" => "2024-08-05T09:13:24.222066Z",
+        "done" => true,
+        "done_reason" => "stop",
+        "eval_count" => 17,
+        "eval_duration" => 303_049_000,
+        "load_duration" => 12_754_875,
+        "message" => %{
+          "content" => "",
+          "role" => "assistant",
+          "tool_calls" => [
+            %{
+              "function" => %{
+                "arguments" => %{"thing" => "hairbrush"},
+                "name" => "custom"
+              }
+            }
+          ]
+        },
+        "model" => "llama3.1",
+        "prompt_eval_count" => 160,
+        "prompt_eval_duration" => 441_402_000,
+        "total_duration" => 757_930_875
+      }
+
+      assert %Message{} = msg = ChatOllamaAI.do_process_response(model, response)
+      assert msg.role == :assistant
+      assert msg.content == nil
+      assert msg.index == nil
+
+      assert [
+               %LangChain.Message.ToolCall{
+                 status: :complete,
+                 type: :function,
+                 name: "custom",
+                 arguments: %{"thing" => "hairbrush"},
+                 index: nil
+               }
+             ] = msg.tool_calls
     end
 
     test "handles receiving a tool call request response", %{model: model} do

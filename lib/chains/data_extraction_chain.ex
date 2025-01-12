@@ -73,7 +73,9 @@ defmodule LangChain.Chains.DataExtractionChain do
   alias LangChain.PromptTemplate
   alias LangChain.Message
   alias LangChain.Message.ToolCall
+  alias LangChain.LangChainError
   alias LangChain.Chains.LLMChain
+  alias LangChain.ChatModels.ChatOpenAI
 
   @function_name "information_extraction"
   @extraction_template ~s"Extract and save the relevant entities mentioned in the following passage together with their properties. Use the value `null` when missing in the passage.
@@ -85,7 +87,7 @@ Passage:
   Run the data extraction chain.
   """
   @spec run(ChatOpenAI.t(), json_schema :: map(), prompt :: [any()], opts :: Keyword.t()) ::
-          {:ok, result :: [any()]} | {:error, String.t()}
+          {:ok, result :: [any()]} | {:error, LangChainError.t()}
   def run(llm, json_schema, prompt, opts \\ []) do
     verbose = Keyword.get(opts, :verbose, false)
 
@@ -93,7 +95,7 @@ Passage:
       messages =
         [
           Message.new_system!(
-            "You are a helpful assistant that extracts structured data from text passages. Only use the functions you have been provided with."
+            "You are a helpful assistant that extracts structured data from text passages. Only use the functions you have been provided with. Extract the data in a single tool use."
           ),
           PromptTemplate.new!(%{role: :user, text: @extraction_template})
         ]
@@ -106,21 +108,23 @@ Passage:
       |> LLMChain.add_messages(messages)
       |> LLMChain.run()
       |> case do
-        {:ok, _updated_chain,
-         %Message{
-           role: :assistant,
-           tool_calls: [
-             %ToolCall{
-               name: @function_name,
-               arguments: %{"info" => info}
-             }
-           ]
+        {:ok,
+         %LLMChain{
+           last_message: %Message{
+             role: :assistant,
+             tool_calls: [
+               %ToolCall{
+                 name: @function_name,
+                 arguments: %{"info" => info}
+               }
+             ]
+           }
          }}
         when is_list(info) ->
           {:ok, info}
 
         other ->
-          {:error, "Unexpected response. #{inspect(other)}"}
+          {:error, LangChainError.exception("Unexpected response. #{inspect(other)}")}
       end
     rescue
       exception ->
@@ -128,7 +132,10 @@ Passage:
           "Caught unexpected exception in DataExtractionChain. Error: #{inspect(exception)}"
         )
 
-        {:error, "Unexpected error in DataExtractionChain. Check logs for details."}
+        {:error,
+         LangChainError.exception(
+           "Unexpected error in DataExtractionChain. Check logs for details."
+         )}
     end
   end
 

@@ -36,6 +36,21 @@ defmodule LangChain.Message do
   support it, and they may require using specific models trained for it. See the
   documentation for the LLM or service for details on their level of support.
 
+  ## Processed Content
+
+  The `processed_content` field is a handy place to store the results of
+  processing a message and needing to hold on to the processed value and store
+  it with the message.
+
+  This is particularly helpful for a `LangChain.MessageProcessors.JsonProcessor`
+  that can process an assistant message and store the processed value on the
+  message itself.
+
+  It is intended for assistant messages when a message processor is applied.
+  This contains the results of the processing. This allows the `content` to
+  reflect what was actually returned from the LLM so it can easily be sent back
+  to the LLM as a part of the entire conversation.
+
   ## Examples
 
   A basic system message example:
@@ -71,10 +86,6 @@ defmodule LangChain.Message do
   embedded_schema do
     # Message content that the LLM sees.
     field :content, :any, virtual: true
-    # For assistant messages when message_processors are applied. This contains
-    # the results of the processing. This allows the `content` to reflect what
-    # was actually returned for when we send it back to the LLM as a historical
-    # message.
     field :processed_content, :any, virtual: true
     field :index, :integer
     field :status, Ecto.Enum, values: [:complete, :cancelled, :length], default: :complete
@@ -189,7 +200,10 @@ defmodule LangChain.Message do
           end
         else
           # only a user message can have ContentParts
-          Logger.error("Invalid message content #{inspect get_field(changeset, :content)} for role #{role}")
+          Logger.error(
+            "Invalid message content #{inspect(get_field(changeset, :content))} for role #{role}"
+          )
+
           add_error(changeset, :content, "is invalid for role #{role}")
         end
 
@@ -230,7 +244,10 @@ defmodule LangChain.Message do
                 # convert the error to text and return error tuple
                 {:error, Utils.changeset_error_to_string(changeset)}
 
-              {:error, reason} ->
+              {:error, %LangChainError{message: message}} ->
+                {:error, message}
+
+              {:error, reason} when is_binary(reason) ->
                 {:error, reason}
             end
           end)
@@ -334,7 +351,8 @@ defmodule LangChain.Message do
   Create a new user message which represents a human message or a message from
   the application.
   """
-  @spec new_user!(content :: String.t() | [ContentPart.t() | PromptTemplate.t()]) :: t() | no_return()
+  @spec new_user!(content :: String.t() | [ContentPart.t() | PromptTemplate.t()]) ::
+          t() | no_return()
   def new_user!(content) do
     case new_user(content) do
       {:ok, msg} ->

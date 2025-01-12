@@ -3,11 +3,12 @@
 Elixir LangChain enables Elixir applications to integrate AI services and self-hosted models into an application.
 
 Currently supported AI services:
+
 - OpenAI ChatGPT
 - OpenAI DALL-e 2 - image generation
 - Anthropic Claude
-- Google AI - https://generativelanguage.googleapis.com
-- Google Vertex AI - Gemini
+- Google Gemini
+- Google Vertex AI (Google's enterprise offering)
 - Ollama
 - Mistral
 - Bumblebee self-hosted models - including Llama, Mistral and Zephyr
@@ -80,16 +81,18 @@ end
 
 Currently, the library is written to use the `Req` library for making API calls.
 
-You can configure an _organization ID_, and _API key_ for OpenAI's API, but this library also works with [other compatible APIs](#alternative-openai-compatible-apis) as well as [local models running on Bumblebee](#bumblebee-chat-support).
+You can configure an _organization ID_, and _API key_ for OpenAI's API, but this library also works with [other compatible APIs](#alternative-openai-compatible-apis) as well as other services and even [local models running on Bumblebee](#bumblebee-chat-support).
 
-`config/config.exs`:
+`config/runtime.exs`:
 
 ```elixir
-config :langchain, openai_key: System.get_env("OPENAI_API_KEY")
-config :langchain, openai_org_id: System.get_env("OPENAI_ORG_ID")
+config :langchain, openai_key: System.fetch_env!("OPENAI_API_KEY")
+config :langchain, openai_org_id: System.fetch_env!("OPENAI_ORG_ID")
 # OR
 config :langchain, openai_key: "YOUR SECRET KEY"
 config :langchain, openai_org_id: "YOUR_OPENAI_ORG_ID"
+
+config :langchain, :anthropic_key, System.fetch_env!("ANTHROPIC_API_KEY")
 ```
 
 It's possible to use a function or a tuple to resolve the secret:
@@ -98,9 +101,26 @@ It's possible to use a function or a tuple to resolve the secret:
 config :langchain, openai_key: {MyApp.Secrets, :openai_api_key, []}
 config :langchain, openai_org_id: {MyApp.Secrets, :openai_org_id, []}
 # OR
-config :langchain, openai_key: fn -> System.get_env("OPENAI_API_KEY") end
-config :langchain, openai_org_id: fn -> System.get_env("OPENAI_ORG_ID") end
+config :langchain, openai_key: fn -> System.fetch_env!("OPENAI_API_KEY") end
+config :langchain, openai_org_id: fn -> System.fetch_env!("OPENAI_ORG_ID") end
 ```
+
+The API keys should be treated as secrets and not checked into your repository.
+
+For [fly.io](https://fly.io), adding the secrets looks like this:
+
+```
+fly secrets set OPENAI_API_KEY=MyOpenAIApiKey
+fly secrets set ANTHROPIC_API_KEY=MyAnthropicApiKey
+```
+
+A list of models to use:
+
+- [Anthropic Claude models](https://docs.anthropic.com/en/docs/about-claude/models)
+- [Anthropic models on AWS Bedrock](https://docs.anthropic.com/en/api/claude-on-amazon-bedrock#accessing-bedrock)
+- [OpenAI models](https://platform.openai.com/docs/models)
+- [OpenAI models on Azure](https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/models)
+- [Gemini AI models](https://ai.google.dev/gemini-api/docs/models/gemini)
 
 ## Usage
 
@@ -123,6 +143,7 @@ alias LangChain.Function
 alias LangChain.Message
 alias LangChain.Chains.LLMChain
 alias LangChain.ChatModels.ChatOpenAI
+alias LangChain.Utils.ChainResult
 
 # map of data we want to be passed as `context` to the function when
 # executed.
@@ -155,19 +176,19 @@ custom_fn =
   })
 
 # create and run the chain
-{:ok, updated_chain, %Message{} = message} =
+{:ok, updated_chain}} =
   LLMChain.new!(%{
     llm: ChatOpenAI.new!(),
     custom_context: custom_context,
     verbose: true
   })
-  |> LLMChain.add_functions(custom_fn)
+  |> LLMChain.add_tools(custom_fn)
   |> LLMChain.add_message(Message.new_user!("Where is the hairbrush located?"))
   |> LLMChain.run(mode: :while_needs_response)
 
 # print the LLM's answer
-IO.puts(message.content)
-#=> "The hairbrush is located in the drawer."
+IO.puts(update |> ChainResult.to_string())
+# => "The hairbrush is located in the drawer."
 ```
 
 ### Alternative OpenAI compatible APIs
@@ -177,7 +198,7 @@ There are several services or self-hosted applications that provide an OpenAI co
 For example, if a locally running service provided that feature, the following code could connect to the service:
 
 ```elixir
-{:ok, updated_chain, %Message{} = message} =
+{:ok, updated_chain} =
   LLMChain.new!(%{
     llm: ChatOpenAI.new!(%{endpoint: "http://localhost:1234/v1/chat/completions"}),
   })
@@ -227,4 +248,3 @@ Executing a specific test, whether it is a `live_call` or not, will execute it c
 When doing local development on the `LangChain` library itself, rename the `.envrc_template` to `.envrc` and populate it with your private API values. This is only used when running live test when explicitly requested.
 
 Use a tool like [Direnv](https://direnv.net/) or [Dotenv](https://github.com/motdotla/dotenv) to load the API values into the ENV when using the library locally.
-

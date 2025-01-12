@@ -65,6 +65,49 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   The OpenAI documentation instructs to provide the `stream_options` with the
   `include_usage: true` for the information to be provided.
 
+  ## Tool Choice
+
+  OpenAI's ChatGPT API supports forcing a tool to be used.
+  - https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
+
+  This is supported through the `tool_choice` options. It takes a plain Elixir map to provide the configuration.
+
+  By default, the LLM will choose a tool call if a tool is available and it determines it is needed. That's the "auto" mode.
+
+  ### Example
+  For the LLM's response to make a tool call of the "get_weather" function.
+
+      ChatOpenAI.new(%{
+        model: "...",
+        tool_choice: %{"type" => "function", "function" => %{"name" => "get_weather"}}
+      })
+
+  ## Azure OpenAI Support
+
+  To use `ChatOpenAI` with Microsoft's Azure hosted OpenAI models, the `endpoint` must be overridden and the API key needs to be provided in some way. The [MS Quickstart guide for REST access](https://learn.microsoft.com/en-us/azure/ai-services/openai/chatgpt-quickstart?tabs=command-line%2Cjavascript-keyless%2Ctypescript-keyless%2Cpython-new&pivots=rest-api) may be helpful.
+
+  In order to use it, you must have an Azure account and from the console, a model must be deployed for your account. Use the Azure AI Foundry and Azure OpenAI Service to deploy the model you want to use. The entire URL is used as the `endpoint` and the provided `key` is used as the `api_key`.
+
+  The following is an example of setting up `ChatOpenAI` for use with an Azure hosted model.
+
+      endpoint = System.fetch_env!("AZURE_OPENAI_ENDPOINT")
+      api_key = System.fetch_env!("AZURE_OPENAI_KEY")
+
+      llm =
+        ChatOpenAI.new!(%{
+          endpoint: endpoint,
+          api_key: api_key,
+          seed: 0,
+          temperature: 1,
+          stream: false
+        })
+
+  The URL itself specifies the model to use and the `model` attribute is disregarded.
+
+  A fake example URL for the endpoint value:
+
+  `https://some-subdomain.cognitiveservices.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-08-01-preview"`
+
   """
   use Ecto.Schema
   require Logger
@@ -122,6 +165,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     # How many chat completion choices to generate for each input message.
     field :n, :integer, default: 1
     field :json_response, :boolean, default: false
+    field :json_schema, :map, default: nil
     field :stream, :boolean, default: false
     field :max_tokens, :integer, default: nil
     # Options for streaming response. Only set this when you set `stream: true`
@@ -131,7 +175,10 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     # streaming.
     field :stream_options, :map, default: nil
 
-    # A list of maps for callback handlers
+    # Tool choice option
+    field :tool_choice, :map
+
+    # A list of maps for callback handlers (treated as internal)
     field :callbacks, {:array, :map}, default: []
 
     # Can send a string user_id to help ChatGPT detect abuse by users of the
@@ -153,10 +200,11 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     :stream,
     :receive_timeout,
     :json_response,
+    :json_schema,
     :max_tokens,
     :stream_options,
     :user,
-    :callbacks
+    :tool_choice
   ]
   @required_fields [:endpoint, :model]
 
@@ -169,6 +217,11 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   @spec get_org_id() :: String.t() | nil
   defp get_org_id() do
     Config.resolve(:openai_org_id)
+  end
+
+  @spec get_proj_id() :: String.t() | nil
+  defp get_proj_id() do
+    Config.resolve(:openai_proj_id)
   end
 
   @doc """
@@ -241,6 +294,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       get_stream_options_for_api(openai.stream_options)
     )
     |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(tools))
+    |> Utils.conditionally_add_to_map(:tool_choice, get_tool_choice(openai))
   end
 
   defp get_tools_for_api(nil), do: []
@@ -258,11 +312,33 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     %{"include_usage" => Map.get(data, :include_usage, Map.get(data, "include_usage"))}
   end
 
-  defp set_response_format(%ChatOpenAI{json_response: true}),
-    do: %{"type" => "json_object"}
+  defp set_response_format(%ChatOpenAI{json_response: true, json_schema: json_schema})
+       when not is_nil(json_schema) do
+    %{
+      "type" => "json_schema",
+      "json_schema" => json_schema
+    }
+  end
 
-  defp set_response_format(%ChatOpenAI{json_response: false}),
-    do: %{"type" => "text"}
+  defp set_response_format(%ChatOpenAI{json_response: true}) do
+    %{"type" => "json_object"}
+  end
+
+  defp set_response_format(%ChatOpenAI{json_response: false}) do
+    %{"type" => "text"}
+  end
+
+  defp get_tool_choice(%ChatOpenAI{
+         tool_choice: %{"type" => "function", "function" => %{"name" => name}} = _tool_choice
+       })
+       when is_binary(name) and byte_size(name) > 0,
+       do: %{"type" => "function", "function" => %{"name" => name}}
+
+  defp get_tool_choice(%ChatOpenAI{tool_choice: %{"type" => type} = _tool_choice})
+       when is_binary(type) and byte_size(type) > 0,
+       do: type
+
+  defp get_tool_choice(%ChatOpenAI{}), do: nil
 
   @doc """
   Convert a LangChain structure to the expected map of data for the OpenAI API.
@@ -442,7 +518,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       end
     rescue
       err in LangChainError ->
-        {:error, err.message}
+        {:error, err}
     end
   end
 
@@ -466,7 +542,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   # Retries the request up to 3 times on transient errors with a 1 second delay
   @doc false
   @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer()) ::
-          list() | struct() | {:error, String.t()}
+          list() | struct() | {:error, LangChainError.t()}
   def do_api_request(openai, messages, tools, retry_count \\ 3)
 
   def do_api_request(_openai, _messages, _tools, 0) do
@@ -497,31 +573,31 @@ defmodule LangChain.ChatModels.ChatOpenAI do
 
     req
     |> maybe_add_org_id_header()
+    |> maybe_add_proj_id_header()
     |> Req.post()
     # parse the body and return it as parsed structs
     |> case do
       {:ok, %Req.Response{body: data} = response} ->
         Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
-          openai,
           get_ratelimit_info(response.headers)
         ])
 
         Callbacks.fire(openai.callbacks, :on_llm_token_usage, [
-          openai,
           get_token_usage(data)
         ])
 
         case do_process_response(openai, data) do
-          {:error, reason} ->
+          {:error, %LangChainError{} = reason} ->
             {:error, reason}
 
           result ->
-            Callbacks.fire(openai.callbacks, :on_llm_new_message, [openai, result])
+            Callbacks.fire(openai.callbacks, :on_llm_new_message, [result])
             result
         end
 
-      {:error, %Req.TransportError{reason: :timeout}} ->
-        {:error, "Request timed out"}
+      {:error, %Req.TransportError{reason: :timeout} = err} ->
+        {:error,
+         LangChainError.exception(type: "timeout", message: "Request timed out", original: err)}
 
       {:error, %Req.TransportError{reason: :closed}} ->
         # Force a retry by making a recursive call decrementing the counter
@@ -552,23 +628,24 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       receive_timeout: openai.receive_timeout
     )
     |> maybe_add_org_id_header()
+    |> maybe_add_proj_id_header()
     |> Req.post(
       into: Utils.handle_stream_fn(openai, &decode_stream/1, &do_process_response(openai, &1))
     )
     |> case do
       {:ok, %Req.Response{body: data} = response} ->
         Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
-          openai,
           get_ratelimit_info(response.headers)
         ])
 
         data
 
-      {:error, %LangChainError{message: reason}} ->
-        {:error, reason}
+      {:error, %LangChainError{} = error} ->
+        {:error, error}
 
-      {:error, %Req.TransportError{reason: :timeout}} ->
-        {:error, "Request timed out"}
+      {:error, %Req.TransportError{reason: :timeout} = err} ->
+        {:error,
+         LangChainError.exception(type: "timeout", message: "Request timed out", original: err)}
 
       {:error, %Req.TransportError{reason: :closed}} ->
         # Force a retry by making a recursive call decrementing the counter
@@ -580,7 +657,8 @@ defmodule LangChain.ChatModels.ChatOpenAI do
           "Unhandled and unexpected response from streamed post call. #{inspect(other)}"
         )
 
-        {:error, "Unexpected response"}
+        {:error,
+         LangChainError.exception(type: "unexpected_response", message: "Unexpected response")}
     end
   end
 
@@ -661,7 +739,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   def do_process_response(model, %{"choices" => [], "usage" => %{} = _usage} = data) do
     case get_token_usage(data) do
       %TokenUsage{} = token_usage ->
-        Callbacks.fire(model.callbacks, :on_llm_token_usage, [model, token_usage])
+        Callbacks.fire(model.callbacks, :on_llm_token_usage, [token_usage])
         :ok
 
       nil ->
@@ -684,8 +762,10 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   # Full message with tool call
   def do_process_response(
         model,
-        %{"finish_reason" => "tool_calls", "message" => %{"tool_calls" => calls} = message} = data
-      ) do
+        %{"finish_reason" => finish_reason, "message" => %{"tool_calls" => calls} = message} =
+          data
+      )
+      when finish_reason in ["tool_calls", "stop"] do
     case Message.new(%{
            "role" => "assistant",
            "content" => message["content"],
@@ -696,8 +776,8 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       {:ok, message} ->
         message
 
-      {:error, changeset} ->
-        {:error, Utils.changeset_error_to_string(changeset)}
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
     end
   end
 
@@ -737,8 +817,8 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       {:ok, message} ->
         message
 
-      {:error, changeset} ->
-        {:error, Utils.changeset_error_to_string(changeset)}
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
     end
   end
 
@@ -756,10 +836,10 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       {:ok, %ToolCall{} = call} ->
         call
 
-      {:error, changeset} ->
+      {:error, %Ecto.Changeset{} = changeset} ->
         reason = Utils.changeset_error_to_string(changeset)
         Logger.error("Failed to process ToolCall for a function. Reason: #{reason}")
-        {:error, reason}
+        {:error, LangChainError.exception(changeset)}
     end
   end
 
@@ -783,10 +863,10 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       {:ok, %ToolCall{} = call} ->
         call
 
-      {:error, changeset} ->
+      {:error, %Ecto.Changeset{} = changeset} ->
         reason = Utils.changeset_error_to_string(changeset)
         Logger.error("Failed to process ToolCall for a function. Reason: #{reason}")
-        {:error, reason}
+        {:error, LangChainError.exception(changeset)}
     end
   end
 
@@ -801,25 +881,44 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       {:ok, message} ->
         message
 
-      {:error, changeset} ->
-        {:error, Utils.changeset_error_to_string(changeset)}
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
     end
+  end
+
+  # MS Azure returns numeric error codes. Interpret them when possible to give a computer-friendly reason
+  #
+  # https://learn.microsoft.com/en-us/troubleshoot/azure/azure-kubernetes/create-upgrade-delete/429-too-many-requests-errors
+  def do_process_response(_model, %{"error" => %{"code" => code, "message" => reason}}) do
+    type =
+      case code do
+        "429" ->
+          "rate_limit_exceeded"
+
+        _other ->
+          nil
+      end
+
+    Logger.error("Received error from API: #{inspect(reason)}")
+    {:error, LangChainError.exception(type: type, message: reason)}
   end
 
   def do_process_response(_model, %{"error" => %{"message" => reason}}) do
     Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, reason}
+    {:error, LangChainError.exception(message: reason)}
   end
 
   def do_process_response(_model, {:error, %Jason.DecodeError{} = response}) do
     error_message = "Received invalid JSON: #{inspect(response)}"
     Logger.error(error_message)
-    {:error, error_message}
+
+    {:error,
+     LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
   end
 
   def do_process_response(_model, other) do
     Logger.error("Trying to process an unexpected response. #{inspect(other)}")
-    {:error, "Unexpected response"}
+    {:error, LangChainError.exception(message: "Unexpected response")}
   end
 
   defp finish_reason_to_status(nil), do: :incomplete
@@ -839,6 +938,16 @@ defmodule LangChain.ChatModels.ChatOpenAI do
 
     if org_id do
       Req.Request.put_header(req, "OpenAI-Organization", org_id)
+    else
+      req
+    end
+  end
+
+  defp maybe_add_proj_id_header(%Req.Request{} = req) do
+    proj_id = get_proj_id()
+
+    if proj_id do
+      Req.Request.put_header(req, "OpenAI-Project", proj_id)
     else
       req
     end
@@ -891,6 +1000,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         :seed,
         :n,
         :json_response,
+        :json_schema,
         :stream,
         :max_tokens,
         :stream_options

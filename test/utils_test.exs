@@ -2,8 +2,10 @@ defmodule LangChain.UtilsTest do
   use ExUnit.Case
 
   doctest LangChain.Utils
+  alias LangChain.Message
   alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.Utils
+  alias LangChain.Chains.LLMChain
 
   defmodule FakeSchema do
     use Ecto.Schema
@@ -166,6 +168,137 @@ defmodule LangChain.UtilsTest do
     test "returns error when not an existing atom" do
       assert {:error, reason} = Utils.module_from_name("Elixir.Missing.Module")
       assert reason == "ChatModel module \"Elixir.Missing.Module\" not found"
+    end
+  end
+
+  describe "split_system_message/2" do
+    test "returns system message and rest separately" do
+      system = Message.new_system!()
+      user_msg = Message.new_user!("Hi")
+      assert {system, [user_msg]} == Utils.split_system_message([system, user_msg])
+    end
+
+    test "return nil when no system message set" do
+      user_msg = Message.new_user!("Hi")
+      assert {nil, [user_msg]} == Utils.split_system_message([user_msg])
+    end
+
+    test "raises exception with multiple system messages" do
+      error_message = "Anthropic only supports a single System message"
+
+      assert_raise LangChain.LangChainError,
+                   error_message,
+                   fn ->
+                     system = Message.new_system!()
+                     user_msg = Message.new_user!("Hi")
+                     Utils.split_system_message([system, user_msg, system], error_message)
+                   end
+    end
+
+    test "has a default error message when no error message provided" do
+      assert_raise LangChain.LangChainError,
+                   "Only one system message is allowed",
+                   fn ->
+                     system = Message.new_system!()
+                     user_msg = Message.new_user!("Hi")
+                     Utils.split_system_message([system, user_msg, system])
+                   end
+    end
+  end
+
+  describe "replace_system_message!/2" do
+    test "returns list with new system message" do
+      non_system = [
+        Message.new_user!("User 1"),
+        Message.new_assistant!("Assistant 1")
+      ]
+
+      [new_system | rest] =
+        Utils.replace_system_message!(
+          [Message.new_system!("System A") | non_system],
+          Message.new_system!("System B")
+        )
+
+      assert rest == non_system
+      assert new_system.role == :system
+      assert new_system.content == "System B"
+    end
+
+    test "handles when no existing system message" do
+      non_system = [
+        Message.new_user!("User 1"),
+        Message.new_assistant!("Assistant 1")
+      ]
+
+      [new_system | rest] =
+        Utils.replace_system_message!(non_system, Message.new_system!("System B"))
+
+      assert rest == non_system
+      assert new_system.role == :system
+      assert new_system.content == "System B"
+    end
+  end
+
+  describe "rewrap_callbacks_for_model/2" do
+    test "wraps all LLM callback functions (not chain callbacks)" do
+      # split across two callback maps
+      callback_1 =
+        %{
+          on_llm_new_delta: fn %LLMChain{custom_context: context}, arg ->
+            "Custom: #{inspect(context)} + #{arg} in on_llm_new_delta"
+          end,
+          on_llm_new_message: fn %LLMChain{custom_context: context}, arg ->
+            "Custom: #{inspect(context)} + #{arg} in on_llm_new_message-1"
+          end
+        }
+
+      callback_2 =
+        %{
+          on_llm_new_message: fn %LLMChain{custom_context: context}, arg ->
+            # a repeated callback
+            "Custom: #{inspect(context)} + #{arg} in on_llm_new_message-2"
+          end,
+          on_llm_ratelimit_info: fn %LLMChain{custom_context: context}, arg ->
+            "Custom: #{inspect(context)} + #{arg} in on_llm_ratelimit_info"
+          end,
+          on_llm_token_usage: fn %LLMChain{custom_context: context}, arg ->
+            "Custom: #{inspect(context)} + #{arg} in on_llm_token_usage"
+          end,
+          on_message_processed: fn _chain, _arg ->
+            :ok
+          end
+        }
+
+      llm = ChatOpenAI.new!(%{})
+
+      chain =
+        %{llm: llm}
+        |> LLMChain.new!()
+        |> LLMChain.update_custom_context(%{value: 1})
+        |> LLMChain.add_callback(callback_1)
+        |> LLMChain.add_callback(callback_2)
+
+      updated_llm = Utils.rewrap_callbacks_for_model(llm, chain.callbacks, chain)
+
+      [group_1, group_2] = updated_llm.callbacks
+
+      assert "Custom: %{value: 1} + delta in on_llm_new_delta" ==
+               group_1.on_llm_new_delta.("delta")
+
+      assert "Custom: %{value: 1} + msg in on_llm_new_message-1" ==
+               group_1.on_llm_new_message.("msg")
+
+      assert "Custom: %{value: 1} + msg in on_llm_new_message-2" ==
+               group_2.on_llm_new_message.("msg")
+
+      assert "Custom: %{value: 1} + info in on_llm_ratelimit_info" ==
+               group_2.on_llm_ratelimit_info.("info")
+
+      assert "Custom: %{value: 1} + usage in on_llm_token_usage" ==
+               group_2.on_llm_token_usage.("usage")
+
+      # not an LLM event. Not included
+      assert group_2[:on_message_processed] == nil
     end
   end
 end

@@ -18,9 +18,9 @@ defmodule LangChain.Function do
     passed to the function. (Use if greater control or unsupported features are
     needed.)
   * `function` - An Elixir function to execute when an LLM requests to execute
-    the function. The function should return `{:ok, "and a text response"}`,
-    `{:error, "and text explanation of the error"}` or just plain `"text
-    response"`, which is returned to the LLM.
+    the function. The function should return `{:ok, "text for LLM"}`, `{:ok,
+    "text for LLM", processed_content}`, `{:error, "and text explanation of the
+    error"}` or just plain `"text response"`, which is returned to the LLM.
   * `async` - Boolean value that flags if this can function can be executed
     asynchronously, potentially concurrently with other calls to the same
     function. Defaults to `true`.
@@ -60,8 +60,8 @@ defmodule LangChain.Function do
   `LangChain.Chains.LLMChain`. This is whatever context data is needed for the
   function to do it's work.
 
-  Context examples may be user_id, account_id, account struct, billing level,
-  etc.
+  Context examples could be data like user_id, account_id, account struct,
+  billing level, etc.
 
   ## Function Parameters
 
@@ -111,6 +111,58 @@ defmodule LangChain.Function do
 
   The `LangChain.FunctionParam` is nestable allowing for arrays of object and
   objects with nested objects.
+
+  ## Example that also stores the Elixir result
+
+  Sometimes we want to process a `ToolCall` from the LLM and keep the processed
+  Elixir data for ourselves. This is particularly useful when using an LLM to
+  perform structured data extraction. Our Elixir function may even process that
+  data into a newly created Ecto Schema database entry. The result of the
+  `ToolCall` that goes back to the LLM must be in a string form. That typically
+  means returning a JSON string of the result data.
+
+  To make it easier to process the data, return a string response to the LLM,
+  but **keep** the original Elixir data as well, our Elixir function can return
+  a 3-tuple result.
+
+      Function.new!(%{name: "create_invoice",
+        parameters: [
+          FunctionParam.new!(%{name: "vendor_name", type: :string, required: true})
+          FunctionParam.new!(%{name: "total_amount", type: :string, required: true})
+        ],
+        function: &execute_create_invoice/2
+      })
+
+      # ...
+
+      def execute_create_invoice(args, %{account_id: account_id} = _context) do
+        case MyApp.Invoices.create_invoice(account_id, args) do
+          {:ok, invoice} ->
+            {:ok, "SUCCESS", invoice}
+
+          {:error, changeset} ->
+            {:error, "ERROR: " <> LangChain.Utils.changeset_error_to_string(changeset)}
+        end
+      end
+
+  In this example, the `LangChain.Function` is tied to the
+  `MyApp.Invoices.create_invoice/2` function in our application.
+
+  The Elixir function returns a 3-tuple result. The `"SUCCESS"` is returned to
+  the LLM. In our scenario, we don't care to return a JSON version of the
+  invoice. The important part is we return the actual
+  `%MyApp.Invoices.Invoice{}` struct in the tuple. This is stored on the
+  `LangChain.ToolResult`'s `processed_content` field.
+
+  This is really helpful when all we want is the final, fully processed Elixir
+  result. This pairs well with the `LLMChain.run(chain, mode: :until_success)`.
+  This is when we want the LLM to perform some data extraction and it should be
+  re-run until it succeeds and we have our final, processed result in the
+  `ToolResult`.
+
+  Note: The LLM may issue one or more `ToolCall`s in a single assistant message.
+  Each Elixir function's `ToolResult` may contain a `processed_content`.
+
   """
   use Ecto.Schema
   import Ecto.Changeset
@@ -124,6 +176,9 @@ defmodule LangChain.Function do
     field :description, :string
     # Optional text the UI can display for when the function is executed.
     field :display_text, :string
+    # Optional flag to indicate if the function should be executed in strict mode.
+    # Defaults to `false`.
+    field :strict, :boolean, default: false
     # flag if the function should be auto-evaluated. Defaults to `false`
     # requiring an explicit step to perform the evaluation.
     # field :auto_evaluate, :boolean, default: false
@@ -146,6 +201,7 @@ defmodule LangChain.Function do
     :name,
     :description,
     :display_text,
+    :strict,
     :parameters_schema,
     :parameters,
     :function,
@@ -198,6 +254,10 @@ defmodule LangChain.Function do
     try do
       # execute the function and normalize the results. Want :ok/:error tuples
       case fun.(arguments, context) do
+        {:ok, llm_result, processed_content} ->
+          # successful execution with additional processed_content.
+          {:ok, llm_result, processed_content}
+
         {:ok, result} ->
           # successful execution.
           {:ok, result}
@@ -222,7 +282,7 @@ defmodule LangChain.Function do
     rescue
       err ->
         Logger.error("Function #{function.name} failed in execution. Exception: #{inspect(err)}")
-        {:error, inspect(err)}
+        {:error, "ERROR: #{inspect(err)}"}
     end
   end
 
