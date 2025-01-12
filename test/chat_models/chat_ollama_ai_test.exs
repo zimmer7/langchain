@@ -3,11 +3,9 @@ defmodule ChatModels.ChatOllamaAITest do
 
   doctest LangChain.ChatModels.ChatOllamaAI
 
-  alias LangChain.{
-    ChatModels.ChatOllamaAI,
-    Function,
-    FunctionParam
-  }
+  alias LangChain.ChatModels.ChatOllamaAI
+  alias LangChain.Function
+  alias LangChain.FunctionParam
 
   use Mimic
 
@@ -152,7 +150,25 @@ defmodule ChatModels.ChatOllamaAITest do
 
       data = ChatOllamaAI.for_api(ollama_ai, [], [fun])
 
-      assert [%{"function" => _} | _] = data.tools
+      assert [%{} = result_data] = data.tools
+
+      assert %{
+               "type" => "function",
+               "function" => %{
+                 "description" => "Gives a friendly greeting for the given subject",
+                 "name" => "give_greeting",
+                 "parameters" => %{
+                   type: "object",
+                   required: ["name"],
+                   properties: %{
+                     name: %{
+                       type: "string",
+                       description: "The subject to greet"
+                     }
+                   }
+                 }
+               }
+             } = result_data
     end
 
     test "generates a map for an API call with a tool using FunctionParams", %{
@@ -170,7 +186,20 @@ defmodule ChatModels.ChatOllamaAITest do
 
       data = ChatOllamaAI.for_api(ollama_ai, [], [fun])
 
-      assert [%{"function" => _} | _] = data.tools
+      assert [%{} = result_data] = data.tools
+
+      assert %{
+               "function" => %{
+                 "description" => "Gives a friendly greeting for the given subject",
+                 "name" => "give_greeting",
+                 "parameters" => %{
+                   "properties" => %{"name" => %{"type" => "string"}},
+                   "required" => ["name"],
+                   "type" => "object"
+                 }
+               },
+               "type" => "function"
+             } = result_data
     end
 
     test "generates a map for an API call with a tool without parameters", %{ollama_ai: ollama_ai} do
@@ -183,7 +212,16 @@ defmodule ChatModels.ChatOllamaAITest do
 
       data = ChatOllamaAI.for_api(ollama_ai, [], [fun])
 
-      assert [%{"function" => _} | _] = data.tools
+      assert [%{} = result_data] = data.tools
+
+      assert %{
+               "function" => %{
+                 "description" => "Be friendly to the world",
+                 "name" => "greet_the_world",
+                 "parameters" => %{"properties" => %{}, "type" => "object"}
+               },
+               "type" => "function"
+             } = result_data
     end
 
     test "generates a map for an API call without tools", %{ollama_ai: ollama_ai} do
